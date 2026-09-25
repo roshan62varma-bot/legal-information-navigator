@@ -1,36 +1,140 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Legal Information Navigator
 
-## Getting Started
+**Understand a contract before you sign it.** Upload a lease, NDA, employment agreement or terms of service and get a plain-English summary, the clauses that could hurt you, answers quoted from the page, a clause-by-clause comparison of two drafts, and a printable list of questions for a lawyer. Results can be explained in 9 languages at 3 reading levels and read aloud.
 
-First, run the development server:
+> Legal **information**, not legal advice. Every output carries a fixed disclaimer, every claim is tied to a quote from your document, and the app never tells you whether to sign.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+---
+
+## The problem
+
+Individuals and small businesses routinely sign documents they do not understand: auto-renewals, worldwide non-competes, one-sided indemnities and mandatory arbitration hide in dense legalese, and an hour of legal review is out of reach for many. The problem statement asks for a GenAI solution that makes legal information **accessible**: help people understand, compare and navigate legal documents, spot risks, ask questions, see their options, and prepare for a professional.
+
+## How each use case is covered
+
+| Problem-statement use case | Feature | Where |
+|---|---|---|
+| Simplifying complex legal documents | **Summarize**: TL;DR, what you must do, what you get, duration, governing law, key dates | `components/tools/summary-tool.tsx`, `POST /api/summarize` |
+| Highlighting clauses, obligations, risks, inconsistencies | **Red flags**: 10 risk patterns (auto-renewal, non-compete, indemnity, arbitration, IP assignment, unilateral amendment, liability cap, liquidated damages, termination for convenience, third-party data sharing) with severity, explanation and a 0-100 one-sidedness score | `redflags-tool.tsx`, `POST /api/redflags` |
+| Comparing contracts, agreements, policies | **Compare**: Myers diff of clauses (added / removed / modified) with a word-level redline, plus what changed and why it matters for each row | `compare-tool.tsx`, `lib/diff.ts`, `POST /api/compare` |
+| Answering questions based on provided documents | **Ask**: retrieval-augmented Q&A that quotes the clause, highlights it in the viewer, and refuses when the document is silent | `ask-tool.tsx`, `lib/server/pipeline.ts`, `POST /api/ask` |
+| Helping users understand options and next steps | **Your options** and **Before you sign** checklist inside the summary; "worth asking about" on every red flag | `SummaryModelSchema.options / checklist` |
+| Generating summaries, checklists, actionable outputs | Summary, interactive checklist, downloadable PDF consultation sheet | `lib/consult-pdf.ts` |
+| Preparing questions for a legal professional | **Consult**: the 5-10 clauses worth paying a lawyer about, 2-4 specific questions each, what to bring | `consult-tool.tsx`, `POST /api/consult` |
+| Access for diverse users | Output in 9 languages, 3 reading levels, read-aloud, text size, dark mode, keyboard and screen-reader support, mobile layout | `components/preferences.tsx` |
+
+---
+
+## GenAI architecture (explicit mapping)
+
+All AI calls go through **Google Gemini** via the Vercel AI SDK (`ai` + `@ai-sdk/google`), server-side only. The API key never reaches the browser.
+
+| # | Gemini service / model | Used for | Integrated in |
+|---|---|---|---|
+| 1 | **Gemini Embeddings** `gemini-embedding-001` (768-dim, `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`) | Embedding every 512-token chunk at upload and every question | `lib/server/gemini.ts` `embedDocuments()` / `embedQuery()`, called from `ingestDocument()` and `answerQuestion()` in `lib/server/pipeline.ts` |
+| 2 | **Gemini Flash-Lite** `gemini-3.5-flash-lite` (structured output) | Cross-encoder **reranker**: scores 12 retrieved passages 0-10 and keeps the top 5 | `geminiReranker` in `lib/server/pipeline.ts` |
+| 3 | **Gemini Flash** (fast tier, streamed structured output) | Plain-English **summary**, options and checklist | `app/api/summarize/route.ts` |
+| 4 | **Gemini Flash** (fast tier, streamed) | Explaining each **diff** row: what changed, why it matters, risk delta | `app/api/compare/route.ts` |
+| 5 | **Gemini Flash** (fast tier, JSON) | **Grounded answers** with citations, generated only from the reranked passages | `answerQuestion()` in `lib/server/pipeline.ts`, `app/api/ask/route.ts` |
+| 6 | **Gemini Pro** `gemini-3.1-pro-preview` (deep tier, streamed) with automatic fallback to Flash | **Red-flag** review and **consultation sheet** (long-form reasoning) | `app/api/redflags/route.ts`, `app/api/consult/route.ts` |
+| 7 | **Gemini multimodal** (PDF input) | **OCR** for scanned PDFs with no text layer, only after the user consents | `transcribePdf()` in `lib/server/gemini.ts`, `app/api/ingest/route.ts` |
+
+Where you can see it in the UI: every AI panel shows a yellow **"Gemini is …"** badge while tokens stream, then **"Generated by Gemini"** with the exact model id. The Ask panel shows the live pipeline (Search, Rerank, Answer, Verify quotes) and a table of the passages Gemini used with their vector, keyword and rerank scores.
+
+Model ids are configurable (`GEMINI_*_MODELS`) because Google retires versions. Gemini 1.5 is no longer available to new keys, so the 3.x equivalents are the defaults. Each tier is a fallback chain: if a model is over quota, overloaded or gives no first token within 22 s, the next one takes over transparently.
+
+### Request flow
+
+```mermaid
+flowchart LR
+  U[PDF / text] --> P[pdfjs-dist in browser]
+  P -->|scanned?| O[Gemini OCR, with consent]
+  P --> S[PII scrubber in browser]
+  O --> S
+  S -->|names, emails, IDs replaced by tokens| I[/api/ingest/]
+  I --> Z[Injection sanitizer] --> C[512-token chunks, 10% overlap, page + section]
+  C --> E[Gemini embeddings]
+  E --> B[(DocumentChunk[] held in the browser)]
+  B --> Q[/api/ask/]
+  Q --> H[Hybrid search: cosine + BM25, RRF] --> R[Gemini reranker, top 5]
+  R --> G[Gemini answer, JSON + citations] --> V{Quotes found in document?}
+  V -->|yes| A[Answer + highlighted source]
+  V -->|no| X[Refusal, nothing invented]
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Accuracy and hallucination controls
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+* **Structured output only.** Every model call uses a Zod schema (`types/legal.ts`); the finished object is validated again in the browser before it is rendered. The disclaimer is appended by our code and enforced with `z.literal`, never written by the model.
+* **Citations are verified, not trusted.** Each citation's excerpt is matched against the document text (`lib/grounding.ts`); matches get a "Verified quote" badge, and wrong page numbers are corrected.
+* **Faithfulness gate for Q&A.** An answer with no verified citation is withheld and replaced by a refusal (RAGAS-style check). If the reranker finds nothing relevant, the generator is never called.
+* **Deterministic pre-scan.** A rule-based clause scanner (`lib/heuristics.ts`) shows likely red flags instantly and is passed to Gemini as hints to confirm or reject.
+* **Deterministic diff.** The comparison table is a Myers diff computed in code; Gemini only annotates rows, so it cannot invent or hide a change.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Security and privacy
 
-## Learn More
+* **PII scrubbing in the browser** before any network call: names, emails, phones, street addresses, SSN / Aadhaar / PAN / passport numbers, IBAN / IFSC / account numbers and Luhn-valid card numbers become stable tokens like `[NAME_1]`. The UI reports what was removed.
+* **Prompt-injection defence**: every prompt is XML-structured (`<system>`, `<retrieved_context page section>`, `<user_query>`). Document and user text is stripped of instruction-like patterns ("ignore previous instructions", "act as", "jailbreak", ...) and of our own tags, and `< >` are escaped so a document cannot close its context block. The sample contract contains a planted injection so you can see it neutralized.
+* **Nothing is stored.** Routes are stateless; the document id is a SHA-256 content hash so the server can detect tampering (409) without keeping state. Request bodies are never logged.
+* **Hardening**: Zod validation on every route, typed `{ error, code }` errors with no stack traces, in-memory sliding-window rate limiting, a strict Content-Security-Policy (`connect-src 'self'`), HSTS, `X-Frame-Options: DENY`, and a key read only from server environment variables.
 
-To learn more about Next.js, take a look at the following resources:
+## Accessibility
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+* WCAG 2.1 AA: automated **axe-core** checks and token **contrast tests** (≥ 4.5:1 in light and dark) in `__tests__/a11y.test.tsx`.
+* Keyboard: skip link, visible focus, Radix tabs whose arrow keys follow the visible orientation, Escape closes menus.
+* Screen readers: labelled controls, `aria-live` streaming status, announcements when a citation moves the document, `lang` set on AI output in the chosen language. Severity is shown by text and shape, not colour alone.
+* **Reading options**: 9 output languages, simple / standard / detailed reading levels, read-aloud (Web Speech API), three text sizes. Dark mode and `prefers-reduced-motion` are respected (the 3D scene holds still).
+* Responsive from 360 px (Document / Analysis switcher) to 1440 px (three panels).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Tech stack
 
-## Deploy on Vercel
+Next.js 14 (App Router) · TypeScript (strict) · Tailwind CSS · shadcn-style Radix components · pdfjs-dist · Vercel AI SDK + Google Gemini · Zod · jsPDF · three.js / react-three-fiber (hero scene) · Vitest.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Project structure
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+types/legal.ts            Zod schemas + types for every boundary
+lib/ingestion.ts          PII scrubber, injection sanitizer, chunking, content ids
+lib/retrieval.ts          cosine, BM25, reciprocal-rank fusion, reranking
+lib/prompts.ts            XML-structured, injection-hardened prompt templates
+lib/grounding.ts          citation verification + faithfulness check
+lib/heuristics.ts         deterministic red-flag pre-scan
+lib/diff.ts               Myers diff, clause segmentation, word diff
+lib/server/gemini.ts      Gemini models, fallback chains, embeddings, OCR
+lib/server/pipeline.ts    ingest and ask pipelines
+app/api/*/route.ts        ingest, summarize, redflags, compare, ask, consult
+components/               viewer (pdf.js), upload, tools, preferences, 3D scene
+__tests__/                unit, integration (mocked Gemini), a11y, fixture NDA
+```
+
+## Run locally
+
+```bash
+npm install
+cp .env.example .env.local     # add GEMINI_API_KEY from https://aistudio.google.com/apikey
+npm run dev                    # http://localhost:3000
+npm test                       # 73 tests: schemas, PII, injection, chunking, retrieval, grounding, diff, red-flag precision, pipeline, a11y
+npm run build
+```
+
+Try it without a file: **Try a sample NDA** loads a one-sided consulting NDA (with personal details and a hidden injection line); in **Compare**, use the standard NDA sample as version B and **Swap A and B**.
+
+## Deploy (Vercel)
+
+Import the repository in Vercel, add the environment variable `GEMINI_API_KEY`, and deploy. No database or other services are needed. The pdf.js worker is copied into `public/` at build time (`prebuild`), which keeps the repository small.
+
+## Tests
+
+| Suite | What it proves |
+|---|---|
+| `schemas.test.ts` | Every AI output shape validates; wrong enums, missing disclaimer, bad ids and wrong embedding sizes are rejected |
+| `ingestion.test.ts` | PII removal per category with stable tokens; injection strings neutralized without damaging legal text; 512-token / 10 % overlap chunking with page + section metadata |
+| `retrieval-grounding.test.ts` | Cosine, BM25, hybrid fusion, reranker floor and failure fallback; citation verification, page repair, faithfulness gate; highlight matching; rate limiter |
+| `diff-redflags.test.ts` | Myers shortest edit script; clause diff on the sample NDAs; **fixture NDA with 5 known red flags all detected at the correct severity with no false positives** |
+| `pipeline.integration.test.ts` | Mocked Gemini end to end: ingest, retrieve, rerank, generate, verify; hallucinated quote rejected; irrelevant question refused without generation; injection never reaches the prompt; model fallback on quota errors |
+| `a11y.test.tsx` | axe-core WCAG 2.1 AA on upload, reading options and output components; token contrast ≥ 4.5:1 |
+
+## Limitations
+
+* Informational only; it cannot tell you whether a clause is enforceable where you live. The consultation sheet exists to take that question to a licensed attorney.
+* Rule-based PII detection can miss unusual formats; you can view the exact text sent to the AI ("Show text sent to AI").
+* Rate limits are per server instance (no shared store), which suits a stateless demo deployment.

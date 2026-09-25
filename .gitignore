@@ -34,3 +34,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# generated at build time
+/public/pdf.worker.min.mjs
+
+# local QA screenshots
+/.qa/
