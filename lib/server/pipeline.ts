@@ -1,41 +1,50 @@
 import "server-only";
 import { z } from "zod";
-import type { AskEvent, DocumentChunk, GroundedAnswer, IngestResponse, Page, Preferences } from "@/types/legal";
+import type { AskEvent, GroundedAnswer, IngestResponse, Page, Preferences, SignedIndex } from "@/types/legal";
 import { AnswerModelSchema, GroundedAnswerSchema, QA_DISCLAIMER } from "@/types/legal";
 import { chunkPages, computeDocumentId, sanitizePages, sanitizeQuery } from "@/lib/ingestion";
 import { hybridSearch, rerank, toRetrievedChunk, type Candidate, type RerankFn } from "@/lib/retrieval";
 import { answerPrompt, rerankPrompt } from "@/lib/prompts";
 import { faithfulness, verifyCitations } from "@/lib/grounding";
+import { dequantize } from "@/lib/vector";
 import { embedDocuments, embedQuery, generateStructured } from "@/lib/server/gemini";
+import { signIndex, verifyIndex } from "@/lib/server/signing";
+import { ApiRouteError } from "@/lib/server/http";
 
 // ---------------------------------------------------------------------------
 // Ingestion: sanitize -> chunk -> embed
 // ---------------------------------------------------------------------------
 
-const EMBED_BATCH = 90;
-
-export async function ingestDocument(pages: Page[]): Promise<IngestResponse> {
+export async function ingestDocument(pages: Page[], signal?: AbortSignal): Promise<IngestResponse> {
   const { pages: clean, neutralized } = sanitizePages(pages);
   const documentId = await computeDocumentId(clean);
   const chunks = chunkPages(clean);
 
-  let retrievalMode: IngestResponse["retrievalMode"] = "hybrid";
+  let index: SignedIndex | null = null;
   try {
-    const vectors: number[][] = [];
-    for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-      const batch = chunks.slice(i, i + EMBED_BATCH);
-      vectors.push(...(await embedDocuments(batch.map((c) => `${c.section}\n${c.text}`))));
-    }
-    chunks.forEach((c, i) => (c.embedding = vectors[i] ?? null));
-    if (chunks.some((c) => c.embedding === null)) throw new Error("missing vectors");
+    const vectors = await embedDocuments(chunks.map((c) => `${c.section}\n${c.text}`), signal);
+    if (vectors.length !== chunks.length) throw new Error("missing vectors");
+    index = { vectors, signature: await signIndex(documentId, vectors) };
   } catch (err) {
     // Embeddings are an optimisation: BM25 keeps Q&A working if they fail.
-    if (err && typeof err === "object" && "code" in err && (err as { code: string }).code === "MISSING_API_KEY") throw err;
-    chunks.forEach((c) => (c.embedding = null));
-    retrievalMode = "lexical";
+    if (err instanceof ApiRouteError && err.code === "MISSING_API_KEY") throw err;
+    index = null;
   }
 
-  return { documentId, chunks, retrievalMode, injectionsNeutralized: neutralized, pages: clean };
+  return { documentId, chunks, index, retrievalMode: index ? "hybrid" : "lexical", injectionsNeutralized: neutralized, pages: clean };
+}
+
+/**
+ * Rebuild the chunk list from the (hash-verified) pages and attach the
+ * client-held vectors only if their HMAC signature is valid.
+ */
+export async function loadIndex(documentId: string, pages: Page[], index: SignedIndex | null) {
+  const chunks = chunkPages(pages);
+  if (!index) return { chunks, vectors: null };
+  if (index.vectors.length !== chunks.length || !(await verifyIndex(documentId, index.vectors, index.signature))) {
+    throw new ApiRouteError(409, "INDEX_INVALID", "The search index for this document is invalid. Upload the document again.");
+  }
+  return { chunks, vectors: index.vectors.map(dequantize) };
 }
 
 // ---------------------------------------------------------------------------
@@ -62,9 +71,14 @@ export const geminiReranker: RerankFn = async (query, candidates: Candidate[]) =
 // Grounded Q&A: retrieve -> rerank -> generate -> verify
 // ---------------------------------------------------------------------------
 
+export type LoadedIndex = Awaited<ReturnType<typeof loadIndex>>;
+
 export type AskOptions = {
+  documentId: string;
   pages: Page[];
-  chunks: DocumentChunk[];
+  index: SignedIndex | null;
+  /** Pre-verified index (the route verifies before streaming); loaded here when absent. */
+  loaded?: LoadedIndex;
   query: string;
   preferences?: Partial<Preferences>;
   emit: (e: AskEvent) => void;
@@ -90,16 +104,17 @@ export async function answerQuestion(opts: AskOptions): Promise<GroundedAnswer> 
   const { emit } = opts;
   const query = sanitizeQuery(opts.query);
 
-  emit({ type: "stage", stage: "retrieve", detail: "Searching your document (vector + keyword)" });
+  const { chunks, vectors } = opts.loaded ?? (await loadIndex(opts.documentId, opts.pages, opts.index));
+  emit({ type: "stage", stage: "retrieve", detail: vectors ? "Searching your document (vector + keyword)" : "Searching your document (keyword)" });
   let queryVector: number[] | null = null;
-  if (opts.chunks.every((c) => c.embedding !== null)) {
+  if (vectors) {
     try {
-      queryVector = await embedQuery(query);
+      queryVector = await embedQuery(query, opts.signal);
     } catch {
       queryVector = null;
     }
   }
-  const candidates = hybridSearch(opts.chunks, query, queryVector, 12);
+  const candidates = hybridSearch(chunks, query, queryVector, vectors, 12);
   emit({ type: "retrieved", chunks: candidates.map(toRetrievedChunk) });
 
   if (candidates.length === 0) {

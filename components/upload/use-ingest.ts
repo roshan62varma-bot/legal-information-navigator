@@ -34,6 +34,7 @@ export function useIngest(onReady: (doc: IngestedDocument) => void) {
         name,
         pages: res.pages,
         chunks: res.chunks,
+        index: res.index,
         retrievalMode: res.retrievalMode,
         source,
         pii: report,

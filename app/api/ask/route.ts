@@ -1,7 +1,7 @@
 import type { AskEvent } from "@/types/legal";
 import { AskRequestSchema } from "@/types/legal";
 import { ApiRouteError, assertDocumentId, enforceRateLimit, errorResponse, parseBody } from "@/lib/server/http";
-import { answerQuestion } from "@/lib/server/pipeline";
+import { answerQuestion, loadIndex } from "@/lib/server/pipeline";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,6 +17,8 @@ export async function POST(req: Request): Promise<Response> {
     enforceRateLimit(req, "ai", 30);
     const body = await parseBody(req, AskRequestSchema);
     await assertDocumentId(body.documentId, body.document);
+    // Reject a forged or stale index with a real HTTP status before any streaming starts.
+    const loaded = await loadIndex(body.documentId, body.document.pages, body.index);
 
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
@@ -24,8 +26,10 @@ export async function POST(req: Request): Promise<Response> {
         const emit = (e: AskEvent) => controller.enqueue(encoder.encode(`${JSON.stringify(e)}\n`));
         try {
           const data = await answerQuestion({
+            documentId: body.documentId,
             pages: body.document.pages,
-            chunks: body.chunks,
+            index: body.index,
+            loaded,
             query: body.query,
             preferences: body.preferences,
             emit,

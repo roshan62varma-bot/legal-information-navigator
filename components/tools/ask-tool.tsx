@@ -89,6 +89,13 @@ export function AskTool({ doc }: { doc: IngestedDocument }) {
     }
   };
 
+  // Stable identity for memoised turns; always calls the latest ask().
+  const askRef = React.useRef(ask);
+  React.useEffect(() => {
+    askRef.current = ask;
+  });
+  const followUp = React.useCallback((q: string) => void askRef.current(q), []);
+
   return (
     <ToolFrame
       title="Ask your document"
@@ -147,7 +154,7 @@ export function AskTool({ doc }: { doc: IngestedDocument }) {
       ) : (
         <div className="space-y-8">
           {turns.map((t) => (
-            <TurnView key={t.id} turn={t} onFollowUp={(q) => void ask(q)} busy={busy} />
+            <TurnView key={t.id} turn={t} onFollowUp={followUp} busy={busy} />
           ))}
           <div ref={endRef} />
         </div>
@@ -156,7 +163,7 @@ export function AskTool({ doc }: { doc: IngestedDocument }) {
   );
 }
 
-function TurnView({ turn, onFollowUp, busy }: { turn: Turn; onFollowUp: (q: string) => void; busy: boolean }) {
+const TurnView = React.memo(function TurnView({ turn, onFollowUp, busy }: { turn: Turn; onFollowUp: (q: string) => void; busy: boolean }) {
   const r = turn.result;
   const finished = !turn.stage;
   return (
@@ -245,7 +252,7 @@ function TurnView({ turn, onFollowUp, busy }: { turn: Turn; onFollowUp: (q: stri
       )}
     </article>
   );
-}
+});
 
 function RetrievalTrace({ chunks }: { chunks: RetrievedChunk[] }) {
   return (

@@ -10,7 +10,7 @@ const toPages = (t) => [{ page: 1, text: t }];
 
 async function post(path, body) {
   const t = Date.now();
-  const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json", Origin: base }, body: JSON.stringify(body) });
   const text = await res.text();
   return { status: res.status, ms: Date.now() - t, model: res.headers.get("x-model"), text };
 }
@@ -19,8 +19,8 @@ const ingest = async (name, text) => {
   const r = await post("/api/ingest", { name, pages: toPages(text), source: "text" });
   if (r.status !== 200) throw new Error(`ingest ${r.status} ${r.text}`);
   const j = JSON.parse(r.text);
-  console.log(`ingest ${name}: ${r.ms}ms mode=${j.retrievalMode} chunks=${j.chunks.length} injections=${j.injectionsNeutralized}`);
-  return { documentId: j.documentId, name, pages: j.pages, chunks: j.chunks };
+  console.log(`ingest ${name}: ${r.ms}ms mode=${j.retrievalMode} chunks=${j.chunks.length} injections=${j.injectionsNeutralized} response=${r.text.length}B`);
+  return { documentId: j.documentId, name, pages: j.pages, chunks: j.chunks, index: j.index };
 };
 
 const A = await ingest("Standard NDA", grab("SAMPLE_STANDARD_NDA"));
@@ -40,7 +40,7 @@ if (which === "all" || which === "redflags") show("redflags", await post("/api/r
 if (which === "all" || which === "compare") show("compare", await post("/api/compare", { documentIdA: A.documentId, documentIdB: B.documentId, documentA: payload(A), documentB: payload(B) }), (j) => ({ verdict: j.verdict, annotations: j.annotations?.map((a) => `${a.rowId} ${a.riskDelta} ${a.severity}: ${a.whatChanged}`) }));
 if (which === "all" || which === "ask") {
   for (const q of ["How long does the non-compete last and where does it apply?", "What is the monthly rent?"]) {
-    const r = await post("/api/ask", { documentId: B.documentId, document: payload(B), chunks: B.chunks, query: q });
+    const r = await post("/api/ask", { documentId: B.documentId, document: payload(B), index: B.index, query: q });
     const events = r.text.trim().split("\n").map((l) => JSON.parse(l));
     const result = events.find((e) => e.type === "result")?.data;
     console.log(`\n== ask "${q}": status=${r.status} ${r.ms}ms stages=${events.filter((e) => e.type === "stage").map((e) => e.stage).join(">")}`);
@@ -50,5 +50,6 @@ if (which === "all" || which === "ask") {
 if (which === "all" || which === "consult") show("consult", await post("/api/consult", { documentId: B.documentId, document: payload(B), concerns: "I may start my own analytics company next year" }), (j) => ({ title: j.documentTitle, items: j.items?.map((i) => `${i.priority} ${i.clauseTitle} (${i.questions?.length}q)`) }));
 
 // Negative cases
+show("forged index", await post("/api/ask", { documentId: B.documentId, document: payload(B), index: { ...B.index, vectors: B.index.vectors.slice().reverse() }, query: "What is the term?" }));
 show("bad request", await post("/api/summarize", { documentId: "nope" }));
 show("tampered doc", await post("/api/summarize", { documentId: B.documentId, document: { ...payload(B), pages: [{ page: 1, text: "changed" }] } }));

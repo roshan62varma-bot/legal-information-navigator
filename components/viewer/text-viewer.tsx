@@ -8,33 +8,39 @@ import { WithPiiTokens } from "@/components/panels/shared";
 import { scrollWithin } from "@/lib/utils";
 import type { HighlightTarget } from "@/components/workspace/workspace-context";
 
+type Target = { page: number; start: number; end: number };
+
+/** Find the quote on the cited page, or on a neighbour (quotes can wrap a page break). start = -1 when not found. */
+function locateExcerpt(pages: readonly Page[], cited: number | null, excerpt: string): Target | null {
+  if (cited === null) return null;
+  for (const p of [cited, cited + 1, cited - 1]) {
+    const page = pages.find((x) => x.page === p);
+    const range = page ? findExcerptRange(page.text, excerpt) : null;
+    if (range) return { page: p, ...range };
+  }
+  return { page: cited, start: -1, end: -1 };
+}
+
 /** Paper-style renderer for pasted text and OCR output (what the AI actually saw, PII tokens included). */
 export function TextViewer({ pages, highlight }: { pages: Page[]; highlight: HighlightTarget | null }) {
   const refs = React.useRef(new Map<number, HTMLElement>());
-  const markRef = React.useRef<HTMLElement | null>(null);
+  const containerRef = React.useRef<HTMLDivElement>(null);
 
-  const target = React.useMemo(() => {
-    if (!highlight) return null;
-    for (const p of [highlight.page, highlight.page + 1, highlight.page - 1]) {
-      const page = pages.find((x) => x.page === p);
-      if (!page) continue;
-      const range = findExcerptRange(page.text, highlight.excerpt);
-      if (range) return { page: p, ...range };
-    }
-    return { page: highlight.page, start: -1, end: -1 };
-  }, [highlight, pages]);
+  const cited = highlight?.page ?? null;
+  const excerpt = highlight?.excerpt ?? "";
+  const nonce = highlight?.nonce ?? 0;
+
+  const target = React.useMemo(() => locateExcerpt(pages, cited, excerpt), [cited, excerpt, pages]);
 
   React.useEffect(() => {
     if (!target) return;
-    const el = markRef.current ?? refs.current.get(target.page) ?? null;
-    scrollWithin(el, markRef.current ? "center" : "start");
-  }, [target, highlight?.nonce]);
-
-  // The <mark> for the current target re-registers itself during commit.
-  markRef.current = null;
+    // After commit, the first <mark> (if the quote was found) is the scroll target; otherwise the page.
+    const mark = containerRef.current?.querySelector<HTMLElement>("mark.cite-hl") ?? null;
+    scrollWithin(mark ?? refs.current.get(target.page) ?? null, mark ? "center" : "start");
+  }, [target, nonce]);
 
   return (
-    <div className="scrollbar-thin h-full overflow-auto bg-ink/[0.04] px-3 py-4 sm:px-5">
+    <div ref={containerRef} className="scrollbar-thin h-full overflow-auto bg-ink/[0.04] px-3 py-4 sm:px-5">
       {pages.map((p) => (
         <article
           key={p.page}
@@ -45,26 +51,14 @@ export function TextViewer({ pages, highlight }: { pages: Page[]; highlight: Hig
           className="relative mx-auto mb-4 max-w-[46rem] bg-sheet px-6 py-7 shadow-sheet sm:px-10 sm:py-10"
         >
           <span className="absolute right-4 top-3 text-2xs tabular-nums text-ink-soft">Page {p.page}</span>
-          <PageText
-            text={p.text}
-            range={target && target.page === p.page && target.start >= 0 ? target : null}
-            markRef={markRef}
-          />
+          <PageText text={p.text} range={target && target.page === p.page && target.start >= 0 ? target : null} />
         </article>
       ))}
     </div>
   );
 }
 
-function PageText({
-  text,
-  range,
-  markRef,
-}: {
-  text: string;
-  range: { start: number; end: number } | null;
-  markRef: React.MutableRefObject<HTMLElement | null>;
-}) {
+const PageText = React.memo(function PageText({ text, range }: { text: string; range: { start: number; end: number } | null }) {
   // Split into paragraphs while keeping absolute offsets, so the highlight range can cross paragraph boundaries.
   const paragraphs: { text: string; offset: number }[] = [];
   let offset = 0;
@@ -88,16 +82,10 @@ function PageText({
         }
         const s = Math.max(0, range.start - para.offset);
         const e = Math.min(para.text.length, range.end - para.offset);
-        const isFirst = range.start >= para.offset;
         return (
           <Tag key={i} className={cls}>
             <WithPiiTokens text={para.text.slice(0, s)} />
-            <mark
-              className="cite-hl"
-              ref={(el) => {
-                if (isFirst) markRef.current = el;
-              }}
-            >
+            <mark className="cite-hl">
               <WithPiiTokens text={para.text.slice(s, e)} />
             </mark>
             <WithPiiTokens text={para.text.slice(e)} />
@@ -106,4 +94,4 @@ function PageText({
       })}
     </div>
   );
-}
+});

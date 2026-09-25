@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { headers } from "next/headers";
 import { Libre_Caslon_Text, Public_Sans } from "next/font/google";
 import "./globals.css";
 
@@ -34,11 +35,12 @@ export const viewport: Viewport = {
 // Runs before paint so the saved theme never flashes the wrong colours.
 const themeScript = `(function(){try{var t=localStorage.getItem('lin-theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d)document.documentElement.classList.add('dark');}catch(e){}})();`;
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
     <html lang="en" className={`${caslon.variable} ${publicSans.variable}`} suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body>
         <a

@@ -103,20 +103,21 @@ describe("Compare, answer and consultation schemas", () => {
 });
 
 describe("Request schemas treat unknown input defensively", () => {
-  it("rejects embeddings of the wrong dimension", () => {
-    const chunk = { id: "c1", page: 1, endPage: 1, section: "s", text: "t", tokenEstimate: 1, embedding: [0.1, 0.2] };
-    expect(DocumentChunkSchema.safeParse(chunk).success).toBe(false);
-    expect(DocumentChunkSchema.safeParse({ ...chunk, embedding: null }).success).toBe(true);
+  it("chunks carry no client-supplied embeddings", () => {
+    const chunk = { id: "c1", page: 1, endPage: 1, section: "s", text: "t", tokenEstimate: 1 };
+    expect(DocumentChunkSchema.safeParse(chunk).success).toBe(true);
+    expect(DocumentChunkSchema.safeParse({ ...chunk, page: 0 }).success).toBe(false);
   });
   it("rejects malformed document ids and too-short questions", () => {
     const base = {
       documentId: "doc_0123456789abcdef",
       document: { documentId: "doc_0123456789abcdef", name: "a", pages: [{ page: 1, text: "x" }] },
-      chunks: [{ id: "c1", page: 1, endPage: 1, section: "s", text: "t", tokenEstimate: 1, embedding: null }],
+      index: null,
       query: "What is the term?",
     };
     expect(AskRequestSchema.safeParse(base).success).toBe(true);
     expect(AskRequestSchema.safeParse({ ...base, query: "hi" }).success).toBe(false);
+    expect(AskRequestSchema.safeParse({ ...base, documentId: "../../etc/passwd" }).success).toBe(false);
     expect(AskRequestSchema.safeParse({ ...base, document: { ...base.document, documentId: "../../etc/passwd" } }).success).toBe(false);
   });
 });

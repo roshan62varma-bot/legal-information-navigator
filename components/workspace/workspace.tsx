@@ -7,14 +7,21 @@ import { cn } from "@/lib/utils";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UploadZone } from "@/components/upload/upload-zone";
 import { DocumentViewer } from "@/components/viewer/document-viewer";
-import { SummaryTool } from "@/components/tools/summary-tool";
-import { RedFlagsTool } from "@/components/tools/redflags-tool";
-import { CompareTool } from "@/components/tools/compare-tool";
-import { AskTool } from "@/components/tools/ask-tool";
-import { ConsultTool } from "@/components/tools/consult-tool";
+import type { IngestedDocument } from "@/types/legal";
+import { useMediaQuery } from "@/lib/hooks";
 import { useWorkspace, type ToolId } from "./workspace-context";
 
 const ContractScene = dynamic(() => import("@/components/three/contract-scene"), { ssr: false });
+
+// Each tool is its own chunk: the first paint only downloads the tool that is open.
+const toolLoading = () => <div className="p-6" aria-busy="true" />;
+const TOOL_COMPONENTS: Record<ToolId, React.ComponentType<{ doc: IngestedDocument }>> = {
+  summary: dynamic(() => import("@/components/tools/summary-tool").then((m) => m.SummaryTool), { loading: toolLoading }),
+  redflags: dynamic(() => import("@/components/tools/redflags-tool").then((m) => m.RedFlagsTool), { loading: toolLoading }),
+  compare: dynamic(() => import("@/components/tools/compare-tool").then((m) => m.CompareTool), { loading: toolLoading }),
+  ask: dynamic(() => import("@/components/tools/ask-tool").then((m) => m.AskTool), { loading: toolLoading }),
+  consult: dynamic(() => import("@/components/tools/consult-tool").then((m) => m.ConsultTool), { loading: toolLoading }),
+};
 
 const TOOLS: { id: ToolId; label: string; blurb: string; icon: React.ReactNode }[] = [
   { id: "summary", label: "Summarize", blurb: "Plain-English overview", icon: <BookText aria-hidden /> },
@@ -24,22 +31,15 @@ const TOOLS: { id: ToolId; label: string; blurb: string; icon: React.ReactNode }
   { id: "consult", label: "Consult", blurb: "Questions for your lawyer", icon: <NotebookPen aria-hidden /> },
 ];
 
-function useIsWide(query = "(min-width: 1280px)"): boolean {
-  const [wide, setWide] = React.useState(false);
-  React.useEffect(() => {
-    const mq = window.matchMedia(query);
-    const on = () => setWide(mq.matches);
-    on();
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
-  }, [query]);
-  return wide;
-}
-
 export function Workspace() {
   const { primary, setDocument, tool, setTool, pane, setPane } = useWorkspace();
   // Arrow-key navigation must match what the user sees: a vertical rail on wide screens, a horizontal strip otherwise.
-  const wide = useIsWide();
+  const wide = useMediaQuery("(min-width: 1280px)");
+  // Tools mount on first visit and then stay mounted, so switching tabs keeps results without re-requesting.
+  const [visited, setVisited] = React.useState<{ doc: string | null; tools: ToolId[] }>({ doc: null, tools: [] });
+  const docId = primary?.documentId ?? null;
+  const visitedTools = visited.doc === docId ? visited.tools : [];
+  if (docId && !visitedTools.includes(tool)) setVisited({ doc: docId, tools: [...visitedTools, tool] });
 
   return (
     <section id="workspace" aria-label="Workspace" className="mx-auto max-w-[1440px] scroll-mt-14 px-0 sm:px-6 sm:py-6">
@@ -131,15 +131,14 @@ export function Workspace() {
           >
             {primary ? (
               <React.Fragment key={primary.documentId}>
-                {TOOLS.map((t) => (
-                  <TabsContent key={t.id} value={t.id} forceMount className="h-full data-[state=inactive]:hidden">
-                    {t.id === "summary" && <SummaryTool doc={primary} />}
-                    {t.id === "redflags" && <RedFlagsTool doc={primary} />}
-                    {t.id === "compare" && <CompareTool doc={primary} />}
-                    {t.id === "ask" && <AskTool doc={primary} />}
-                    {t.id === "consult" && <ConsultTool doc={primary} />}
-                  </TabsContent>
-                ))}
+                {TOOLS.map((t) => {
+                  const Tool = TOOL_COMPONENTS[t.id];
+                  return (
+                    <TabsContent key={t.id} value={t.id} forceMount className="h-full data-[state=inactive]:hidden">
+                      {(visitedTools.includes(t.id) || t.id === tool) && <Tool doc={primary} />}
+                    </TabsContent>
+                  );
+                })}
               </React.Fragment>
             ) : (
               <NoDocument />

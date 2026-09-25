@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DocumentChunk } from "@/types/legal";
 import { bm25Scores, cosineSimilarity, hybridSearch, rerank } from "@/lib/retrieval";
+import { dequantize, quantize } from "@/lib/vector";
 import { excerptCoverage, faithfulness, verifyAndRepairCitation, verifyCitation } from "@/lib/grounding";
 import { findExcerptRange } from "@/lib/highlight";
 import { checkRateLimit, __resetRateLimits } from "@/lib/server/rate-limit";
@@ -11,14 +12,13 @@ const vec = (...xs: number[]) => {
   return v;
 };
 
-const chunk = (id: string, text: string, embedding: number[] | null, page = 1): DocumentChunk => ({
+const chunk = (id: string, text: string, page = 1): DocumentChunk => ({
   id,
   page,
   endPage: page,
   section: id,
   text,
   tokenEstimate: 10,
-  embedding,
 });
 
 describe("vector math", () => {
@@ -39,26 +39,27 @@ describe("vector math", () => {
 
 describe("hybridSearch + rerank", () => {
   const chunks = [
-    chunk("c1", "Rent is payable on the first day of each month.", vec(0, 1)),
-    chunk("c2", "Either party may terminate this lease with sixty days notice.", vec(1, 0.1)),
-    chunk("c3", "The tenant must keep the premises clean.", vec(0.2, 0.2)),
+    chunk("c1", "Rent is payable on the first day of each month."),
+    chunk("c2", "Either party may terminate this lease with sixty days notice."),
+    chunk("c3", "The tenant must keep the premises clean."),
   ];
+  // Stored the way the app stores them: int8-quantised, base64, then decoded on the server.
+  const vectors = [vec(0, 1), vec(1, 0.1), vec(0.2, 0.2)].map((v) => dequantize(quantize(v)));
 
   it("fuses vector and keyword rankings", () => {
-    const r = hybridSearch(chunks, "how do I terminate the lease", vec(1, 0), 3);
+    const r = hybridSearch(chunks, "how do I terminate the lease", vec(1, 0), vectors, 3);
     expect(r[0].chunk.id).toBe("c2");
     expect(r[0].vectorScore).not.toBeNull();
   });
 
   it("falls back to keyword-only when embeddings are missing", () => {
-    const lexical = chunks.map((c) => ({ ...c, embedding: null }));
-    const r = hybridSearch(lexical, "terminate lease notice", null, 3);
+    const r = hybridSearch(chunks, "terminate lease notice", null, null, 3);
     expect(r[0].chunk.id).toBe("c2");
     expect(r[0].vectorScore).toBeNull();
   });
 
   it("keeps only reranked passages above the relevance floor, best first", async () => {
-    const candidates = hybridSearch(chunks, "rent terminate clean", vec(0.5, 0.5), 3);
+    const candidates = hybridSearch(chunks, "rent terminate clean", vec(0.5, 0.5), vectors, 3);
     const reranker = vi.fn(async () => new Map([["c1", 9], ["c2", 5], ["c3", 1]]));
     const top = await rerank("q", candidates, reranker, { topK: 5, minScore: 4 });
     expect(top.map((t) => t.chunk.id)).toEqual(["c1", "c2"]);
@@ -66,7 +67,7 @@ describe("hybridSearch + rerank", () => {
   });
 
   it("survives a failing reranker by keeping fused order", async () => {
-    const candidates = hybridSearch(chunks, "terminate", vec(1, 0), 3);
+    const candidates = hybridSearch(chunks, "terminate", vec(1, 0), vectors, 3);
     const top = await rerank("q", candidates, async () => {
       throw new Error("quota");
     });

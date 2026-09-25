@@ -1,9 +1,10 @@
 import type { DocumentChunk, RetrievedChunk } from "@/types/legal";
+import { dotQuantized, normalize } from "@/lib/vector";
 
 /**
  * Retrieval over an in-memory DocumentChunk[]; no vector DB.
  *
- *   query ─┬─ dense: cosine(queryEmbedding, chunk.embedding)
+ *   query ─┬─ dense: cosine(queryEmbedding, chunk vector)  (unit vectors: a dot product)
  *          └─ sparse: BM25 over chunk text
  *                 │
  *        reciprocal-rank fusion (k = 60)  -> top N candidates
@@ -82,10 +83,14 @@ export type Candidate = {
   fusedScore: number;
 };
 
+/**
+ * @param vectors int8-quantised unit vectors aligned with `chunks` (lib/vector.ts), or null for keyword-only search.
+ */
 export function hybridSearch(
   chunks: readonly DocumentChunk[],
   query: string,
-  queryEmbedding: readonly number[] | null,
+  queryEmbedding: ArrayLike<number> | null,
+  vectors: readonly Int8Array[] | null,
   topN = 12,
   rrfK = 60,
 ): Candidate[] {
@@ -93,8 +98,9 @@ export function hybridSearch(
   const lexical = bm25Scores(query, chunks.map((c) => `${c.section} ${c.text}`));
   const lexRanks = ranksOf(lexical);
 
-  const canUseVectors = queryEmbedding !== null && chunks.every((c) => c.embedding !== null);
-  const vector = canUseVectors ? chunks.map((c) => cosineSimilarity(queryEmbedding!, c.embedding!)) : null;
+  const canUseVectors = queryEmbedding !== null && vectors !== null && vectors.length === chunks.length;
+  const unitQuery = canUseVectors ? normalize(queryEmbedding!) : null;
+  const vector = unitQuery ? vectors!.map((v) => dotQuantized(unitQuery, v)) : null;
   const vecRanks = vector ? ranksOf(vector) : null;
 
   const candidates = chunks.map((chunk, i) => {

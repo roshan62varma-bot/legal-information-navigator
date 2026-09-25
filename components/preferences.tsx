@@ -5,6 +5,7 @@ import { Check, Pause, Settings2, Volume2 } from "lucide-react";
 import type { Language, Preferences, ReadingLevel } from "@/types/legal";
 import { LANGUAGES } from "@/types/legal";
 import { cn } from "@/lib/utils";
+import { useBrowserSupports } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 
 /**
@@ -27,37 +28,70 @@ type PrefsState = Preferences & {
 const KEY = "lin-prefs";
 const Ctx = React.createContext<PrefsState | null>(null);
 
+// ---------------------------------------------------------------------------
+// Tiny external store over localStorage (read once, synced across tabs).
+// ---------------------------------------------------------------------------
+
+type Stored = Preferences & { textSize: TextSize };
+const DEFAULTS: Stored = { language: "en", readingLevel: "standard", textSize: "base" };
+let snapshot: Stored | null = null;
+const listeners = new Set<() => void>();
+
+function readStored(): Stored {
+  if (snapshot) return snapshot;
+  let saved: Partial<Stored> = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(KEY) ?? "{}") as Partial<Stored>;
+  } catch {
+    /* storage unavailable or corrupt: defaults apply */
+  }
+  snapshot = {
+    language: saved.language && saved.language in LANGUAGES ? saved.language : DEFAULTS.language,
+    readingLevel: saved.readingLevel && ["simple", "standard", "detailed"].includes(saved.readingLevel) ? saved.readingLevel : DEFAULTS.readingLevel,
+    textSize: saved.textSize && ["base", "lg", "xl"].includes(saved.textSize) ? saved.textSize : DEFAULTS.textSize,
+  };
+  return snapshot;
+}
+
+function writeStored(patch: Partial<Stored>): void {
+  snapshot = { ...readStored(), ...patch };
+  try {
+    localStorage.setItem(KEY, JSON.stringify(snapshot));
+  } catch {
+    /* storage blocked: the choice still applies for this visit */
+  }
+  listeners.forEach((l) => l());
+}
+
+function subscribe(notify: () => void): () => void {
+  listeners.add(notify);
+  const onStorage = (e: StorageEvent) => {
+    if (e.key !== KEY) return;
+    snapshot = null;
+    notify();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => {
+    listeners.delete(notify);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
 export function PreferencesProvider({ children }: { children: React.ReactNode }) {
-  const [language, setLanguage] = React.useState<Language>("en");
-  const [readingLevel, setReadingLevel] = React.useState<ReadingLevel>("standard");
-  const [textSize, setTextSize] = React.useState<TextSize>("base");
-  const loaded = React.useRef(false);
+  const stored = React.useSyncExternalStore(subscribe, readStored, () => DEFAULTS);
 
   React.useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(KEY) ?? "{}") as Partial<PrefsState>;
-      if (saved.language && saved.language in LANGUAGES) setLanguage(saved.language);
-      if (saved.readingLevel && ["simple", "standard", "detailed"].includes(saved.readingLevel)) setReadingLevel(saved.readingLevel);
-      if (saved.textSize && ["base", "lg", "xl"].includes(saved.textSize)) setTextSize(saved.textSize);
-    } catch {
-      /* storage unavailable: defaults apply */
-    }
-    loaded.current = true;
-  }, []);
+    document.documentElement.dataset.textSize = stored.textSize;
+  }, [stored.textSize]);
 
-  React.useEffect(() => {
-    document.documentElement.dataset.textSize = textSize;
-    if (!loaded.current) return;
-    try {
-      localStorage.setItem(KEY, JSON.stringify({ language, readingLevel, textSize }));
-    } catch {
-      /* ignore */
-    }
-  }, [language, readingLevel, textSize]);
-
-  const value = React.useMemo(
-    () => ({ language, readingLevel, textSize, setLanguage, setReadingLevel, setTextSize }),
-    [language, readingLevel, textSize],
+  const value = React.useMemo<PrefsState>(
+    () => ({
+      ...stored,
+      setLanguage: (language) => writeStored({ language }),
+      setReadingLevel: (readingLevel) => writeStored({ readingLevel }),
+      setTextSize: (textSize) => writeStored({ textSize }),
+    }),
+    [stored],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
@@ -189,14 +223,12 @@ export function PreferencesMenu() {
 export function ReadAloud({ text, label = "Read aloud" }: { text: string | undefined; label?: string }) {
   const { language } = usePreferences();
   const [speaking, setSpeaking] = React.useState(false);
-  const [supported, setSupported] = React.useState(false);
+  const supported = useBrowserSupports(() => "speechSynthesis" in window);
 
   React.useEffect(() => {
-    setSupported(typeof window !== "undefined" && "speechSynthesis" in window);
-    return () => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
-    };
-  }, []);
+    if (!supported) return;
+    return () => window.speechSynthesis.cancel();
+  }, [supported]);
 
   if (!supported || !text) return null;
 

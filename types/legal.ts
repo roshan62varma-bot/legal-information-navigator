@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { BASE64_PATTERN, QUANTIZED_LENGTH } from "@/lib/vector";
 
 /**
  * Single source of truth for every shape that crosses a boundary:
@@ -72,9 +73,21 @@ export const DocumentChunkSchema = z.object({
   section: z.string().max(200),
   text: z.string().min(1).max(8_000),
   tokenEstimate: z.number().int().nonnegative(),
-  embedding: z.array(z.number()).length(LIMITS.embeddingDims).nullable(),
 });
 export type DocumentChunk = z.infer<typeof DocumentChunkSchema>;
+
+/**
+ * Search index held by the browser: one int8-quantised, base64 embedding per
+ * chunk (same order as the server's deterministic chunking), plus an HMAC
+ * signature so the vectors cannot be forged or swapped between documents.
+ */
+export const SignedIndexSchema = z
+  .object({
+    vectors: z.array(z.string().length(QUANTIZED_LENGTH).regex(BASE64_PATTERN)).min(1).max(LIMITS.maxChunks),
+    signature: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  })
+  .strict();
+export type SignedIndex = z.infer<typeof SignedIndexSchema>;
 
 export const PiiCategorySchema = z.enum([
   "name",
@@ -94,11 +107,13 @@ export type PiiReport = {
 };
 
 /** The document as the browser holds it. Nothing is persisted server-side. */
-export const DocumentPayloadSchema = z.object({
-  documentId: z.string().regex(/^doc_[a-f0-9]{16,64}$/),
-  name: z.string().min(1).max(200),
-  pages: z.array(PageSchema).min(1).max(LIMITS.maxPages),
-});
+export const DocumentPayloadSchema = z
+  .object({
+    documentId: z.string().regex(/^doc_[a-f0-9]{16,64}$/),
+    name: z.string().min(1).max(200),
+    pages: z.array(PageSchema).min(1).max(LIMITS.maxPages),
+  })
+  .strict();
 export type DocumentPayload = z.infer<typeof DocumentPayloadSchema>;
 
 export const RetrievalModeSchema = z.enum(["hybrid", "lexical"]);
@@ -106,6 +121,7 @@ export type RetrievalMode = z.infer<typeof RetrievalModeSchema>;
 
 export type IngestedDocument = DocumentPayload & {
   chunks: DocumentChunk[];
+  index: SignedIndex | null;
   retrievalMode: RetrievalMode;
   source: "pdf" | "text" | "ocr";
   pii: PiiReport | null;
@@ -370,16 +386,21 @@ export type ConsultationSheet = z.infer<typeof ConsultationSheetSchema>;
 // API request bodies
 // ---------------------------------------------------------------------------
 
-export const IngestRequestSchema = z.object({
-  name: z.string().min(1).max(200),
-  pages: z.array(PageSchema).min(1).max(LIMITS.maxPages),
-  source: z.enum(["pdf", "text", "ocr"]),
-});
+// Every request schema is .strict(): unknown keys are rejected, not silently ignored.
+
+export const IngestRequestSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    pages: z.array(PageSchema).min(1).max(LIMITS.maxPages),
+    source: z.enum(["pdf", "text", "ocr"]),
+  })
+  .strict();
 export type IngestRequest = z.infer<typeof IngestRequestSchema>;
 
 export type IngestResponse = {
   documentId: string;
   chunks: DocumentChunk[];
+  index: SignedIndex | null;
   retrievalMode: RetrievalMode;
   injectionsNeutralized: number;
   pages: Page[];
@@ -390,35 +411,46 @@ export type OcrResponse = {
   method: "pdf-parse" | "gemini-ocr";
 };
 
-export const DocumentRequestSchema = z.object({
-  documentId: z.string(),
-  document: DocumentPayloadSchema,
-  preferences: PreferencesSchema.optional(),
-});
+const DocumentIdSchema = z.string().regex(/^doc_[a-f0-9]{16,64}$/);
+const RequestPreferencesSchema = PreferencesSchema.strict().optional();
+
+export const DocumentRequestSchema = z
+  .object({
+    documentId: DocumentIdSchema,
+    document: DocumentPayloadSchema,
+    preferences: RequestPreferencesSchema,
+  })
+  .strict();
 
 export const SummarizeRequestSchema = DocumentRequestSchema.extend({
   focus: z.string().max(LIMITS.maxQueryChars).optional(),
-});
+}).strict();
 
 export const RedFlagsRequestSchema = DocumentRequestSchema.extend({
   perspective: z.string().max(80).optional(),
-});
+}).strict();
 
-export const CompareRequestSchema = z.object({
-  documentIdA: z.string(),
-  documentIdB: z.string(),
-  documentA: DocumentPayloadSchema,
-  documentB: DocumentPayloadSchema,
-  preferences: PreferencesSchema.optional(),
-});
+export const CompareRequestSchema = z
+  .object({
+    documentIdA: DocumentIdSchema,
+    documentIdB: DocumentIdSchema,
+    documentA: DocumentPayloadSchema,
+    documentB: DocumentPayloadSchema,
+    preferences: RequestPreferencesSchema,
+  })
+  .strict();
 
+/**
+ * Chunk text is never accepted from the client: the server re-derives the
+ * chunks from the hash-verified pages. Only the signed vectors travel.
+ */
 export const AskRequestSchema = DocumentRequestSchema.extend({
   query: z.string().trim().min(3, "Ask a longer question").max(LIMITS.maxQueryChars),
-  chunks: z.array(DocumentChunkSchema).min(1).max(LIMITS.maxChunks),
-});
+  index: SignedIndexSchema.nullable(),
+}).strict();
 
 export const ConsultRequestSchema = DocumentRequestSchema.extend({
   concerns: z.string().max(LIMITS.maxQueryChars).optional(),
-});
+}).strict();
 
 export type ApiError = { error: string; code: string };

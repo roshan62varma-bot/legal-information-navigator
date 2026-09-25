@@ -4,6 +4,7 @@ import * as React from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { ContactShadows, Float, RoundedBox } from "@react-three/drei";
 import * as THREE from "three";
+import { useInView, useIsDark, usePrefersReducedMotion } from "@/lib/hooks";
 
 /**
  * A contract being read: text lines on a sheet, highlighter strokes sweeping
@@ -15,31 +16,6 @@ type Palette = { paper: string; back: string; ink: string; inkSoft: string; high
 
 const LIGHT: Palette = { paper: "#fdfdfb", back: "#e7ebf2", ink: "#1b2a4a", inkSoft: "#8a94ab", highlight: "#f6d65c", redline: "#c0342a", seal: "#1c7a57", brass: "#b8893a" };
 const DARK: Palette = { paper: "#eef1f6", back: "#2a3552", ink: "#1b2a4a", inkSoft: "#7d879d", highlight: "#f6d65c", redline: "#d8453a", seal: "#2f9b72", brass: "#c99a47" };
-
-export function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState(false);
-  React.useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    setReduced(mq.matches);
-    const on = () => setReduced(mq.matches);
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
-  }, []);
-  return reduced;
-}
-
-export function useIsDark(): boolean {
-  const [dark, setDark] = React.useState(false);
-  React.useEffect(() => {
-    const el = document.documentElement;
-    const read = () => setDark(el.classList.contains("dark"));
-    read();
-    const mo = new MutationObserver(read);
-    mo.observe(el, { attributes: true, attributeFilter: ["class"] });
-    return () => mo.disconnect();
-  }, []);
-  return dark;
-}
 
 // Deterministic "text": line widths for a clause-like layout.
 const LINES: { y: number; w: number; x: number; kind?: "heading" | "highlight" | "redline" | "insert" }[] = (() => {
@@ -239,10 +215,16 @@ function Scene({ scanning, compact }: { scanning: boolean; compact: boolean }) {
 }
 
 export default function ContractScene({ scanning = false, compact = false, label }: { scanning?: boolean; compact?: boolean; label: string }) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  // No GPU work while the scene is scrolled away or the tab is in the background;
+  // with reduced motion the scene renders on demand only (a still frame).
+  const visible = useInView(ref);
+  const reduced = usePrefersReducedMotion();
   return (
-    <div className="h-full w-full" role="img" aria-label={label}>
+    <div ref={ref} className="h-full w-full" role="img" aria-label={label}>
       <Canvas
-        dpr={[1, 1.75]}
+        frameloop={!visible ? "never" : reduced ? "demand" : "always"}
+        dpr={[1, 1.5]}
         shadows
         camera={{ position: [0, 0, compact ? 4.6 : 4.9], fov: 38 }}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}

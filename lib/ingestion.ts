@@ -363,7 +363,6 @@ export function chunkPages(
       section: dominant.slice(0, 200),
       text: text.slice(0, 8000),
       tokenEstimate: estimateTokens(text),
-      embedding: null,
     });
     if (start + windowWords >= words.length) break;
     if (chunks.length >= LIMITS.maxChunks) break;

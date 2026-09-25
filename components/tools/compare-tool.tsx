@@ -41,6 +41,13 @@ export function CompareTool({ doc }: { doc: IngestedDocument }) {
     run({ documentIdA: doc.documentId, documentIdB: secondary.documentId, documentA: toPayload(doc), documentB: toPayload(secondary), preferences });
 
   const rows = diff ? diff.rows.filter((r) => showUnchanged || r.kind !== "unchanged") : [];
+  // Stable callback so memoised rows only re-render when their own annotation changes.
+  const showClause = React.useCallback(
+    (clause: DiffRow["before"], slot: "primary" | "secondary") => {
+      if (clause) focusCitation({ page: clause.page, excerpt: clause.text.slice(0, 160) }, slot);
+    },
+    [focusCitation],
+  );
   const riskTally = React.useMemo(() => {
     let more = 0;
     let less = 0;
@@ -136,10 +143,7 @@ export function CompareTool({ doc }: { doc: IngestedDocument }) {
                 row={r}
                 annotation={annotations.get(r.id)}
                 pending={isLoading && r.kind !== "unchanged" && !annotations.get(r.id)}
-                onShow={(slot) => {
-                  const clause = slot === "primary" ? r.before : r.after;
-                  if (clause) focusCitation({ page: clause.page, excerpt: clause.text.slice(0, 160) }, slot);
-                }}
+                onShow={showClause}
               />
             ))}
           </ol>
@@ -159,7 +163,7 @@ function Stat({ label, value, className }: { label: string; value: number; class
   );
 }
 
-function DiffRowCard({
+const DiffRowCard = React.memo(function DiffRowCard({
   row,
   annotation,
   pending,
@@ -168,7 +172,7 @@ function DiffRowCard({
   row: DiffRow;
   annotation: Partial<DiffAnnotation> | undefined;
   pending: boolean;
-  onShow: (slot: "primary" | "secondary") => void;
+  onShow: (clause: DiffRow["before"], slot: "primary" | "secondary") => void;
 }) {
   const [expanded, setExpanded] = React.useState(false);
   if (row.kind === "unchanged") {
@@ -228,12 +232,12 @@ function DiffRowCard({
             </button>
           )}
           {row.before && (
-            <button className="text-ink-soft hover:text-ink" onClick={() => onShow("primary")}>
+            <button className="text-ink-soft hover:text-ink" onClick={() => onShow(row.before, "primary")}>
               Show in version A (page {row.before.page})
             </button>
           )}
           {row.after && (
-            <button className="text-ink-soft hover:text-ink" onClick={() => onShow("secondary")}>
+            <button className="text-ink-soft hover:text-ink" onClick={() => onShow(row.after, "secondary")}>
               Show in version B (page {row.after.page})
             </button>
           )}
@@ -262,7 +266,7 @@ function DiffRowCard({
       </div>
     </li>
   );
-}
+});
 
 function RiskDeltaBadge({ delta }: { delta: DiffAnnotation["riskDelta"] }) {
   if (delta === "MORE_RISK")

@@ -183,7 +183,7 @@ const EDGE: Record<Severity, string> = {
   LOW: "border-l-sev-low-fg",
 };
 
-function FlagCard({ flag, doc, done }: { flag: Partial<RedFlag>; doc: IngestedDocument; done: boolean }) {
+const FlagCard = React.memo(function FlagCard({ flag, doc, done }: { flag: Partial<RedFlag>; doc: IngestedDocument; done: boolean }) {
   const citation = React.useMemo(() => {
     const c = flag.citation;
     if (!done || !c?.excerpt || !c.page) return null;
@@ -217,4 +217,4 @@ function FlagCard({ flag, doc, done }: { flag: Partial<RedFlag>; doc: IngestedDo
       </div>
     </li>
   );
-}
+});

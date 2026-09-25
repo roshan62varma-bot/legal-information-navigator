@@ -28,12 +28,48 @@ export function errorResponse(err: unknown): Response {
   return Response.json(body, { status: 500, headers: NO_STORE });
 }
 
-export async function parseBody<T extends z.ZodTypeAny>(req: Request, schema: T, maxBytes = 4_000_000): Promise<z.infer<T>> {
-  const length = Number(req.headers.get("content-length") ?? "0");
-  if (length > maxBytes) throw new ApiRouteError(413, "PAYLOAD_TOO_LARGE", "This document is too large to analyse. Try a shorter file.");
+const TOO_LARGE = () => new ApiRouteError(413, "PAYLOAD_TOO_LARGE", "This document is too large to analyse. Try a shorter file.");
+
+/**
+ * Read the body with a hard byte cap enforced while streaming, so a request
+ * without (or lying about) Content-Length cannot make the server buffer an
+ * unbounded payload.
+ */
+export async function readBodyLimited(req: Request, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (declared > maxBytes) throw TOO_LARGE();
+  if (!req.body) return new Uint8Array(new ArrayBuffer(0));
+  const reader = req.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw TOO_LARGE();
+    }
+    parts.push(value);
+  }
+  const out = new Uint8Array(new ArrayBuffer(total));
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.byteLength;
+  }
+  return out;
+}
+
+export async function parseBody<T extends z.ZodType>(req: Request, schema: T, maxBytes = 3_000_000): Promise<z.infer<T>> {
+  const type = req.headers.get("content-type") ?? "";
+  if (!type.toLowerCase().startsWith("application/json")) {
+    throw new ApiRouteError(415, "UNSUPPORTED_MEDIA_TYPE", "Send the request as application/json.");
+  }
+  const bytes = await readBodyLimited(req, maxBytes);
   let json: unknown;
   try {
-    json = await req.json();
+    json = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
     throw new ApiRouteError(400, "INVALID_JSON", "Request body must be valid JSON.");
   }

@@ -1,9 +1,10 @@
 import "server-only";
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { embed, embedMany, generateObject, streamObject, type LanguageModelV1 } from "ai";
+import { createGoogle, type GoogleProvider } from "@ai-sdk/google";
+import { embed, embedMany, generateText, Output, streamText, type EmbeddingModel, type LanguageModel } from "ai";
 import type { z } from "zod";
 import { LIMITS } from "@/types/legal";
 import { GUARDRAILS } from "@/lib/prompts";
+import { quantize } from "@/lib/vector";
 import { ApiRouteError } from "@/lib/server/http";
 
 /**
@@ -33,24 +34,52 @@ export const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL ?? "gemini-emb
 const FIRST_TOKEN_MS = Number(process.env.GEMINI_FIRST_TOKEN_MS ?? 22_000);
 /** Whole-call budget per attempt for non-streaming calls. */
 const CALL_MS = Number(process.env.GEMINI_CALL_MS ?? 30_000);
+/** Embedding batches sent concurrently (Gemini accepts up to 100 texts per call). */
+const EMBED_BATCH = 100;
+const EMBED_CONCURRENCY = 3;
 
 export type Tier = "lite" | "fast" | "deep";
 
-function apiKey(): string {
+// One provider instance per process: avoids rebuilding HTTP config on every call.
+let cachedProvider: { key: string; provider: GoogleProvider } | null = null;
+
+function provider(): GoogleProvider {
   const key = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_GENERATIVE_AI_API_KEY;
   if (!key) {
     throw new ApiRouteError(503, "MISSING_API_KEY", "The server has no Gemini API key. Add GEMINI_API_KEY to .env.local and restart.");
   }
-  return key;
+  if (cachedProvider?.key !== key) cachedProvider = { key, provider: createGoogle({ apiKey: key }) };
+  return cachedProvider.provider;
 }
 
-function provider() {
-  return createGoogleGenerativeAI({ apiKey: apiKey() });
+// ---------------------------------------------------------------------------
+// Circuit breaker: a model that just failed (quota, overload, timeout, 404)
+// is skipped for a cooldown instead of costing every request another
+// 1-22 s round trip. If every model is cooling down, the full chain is tried.
+// ---------------------------------------------------------------------------
+
+const unavailableUntil = new Map<string, number>();
+
+export function cooldownFor(error: string): number {
+  if (/404|not found|no longer available/i.test(error)) return 10 * 60_000;
+  if (/429|quota|exhausted/i.test(error)) return 60_000;
+  if (/timeout|503|overload|high demand|unavailable/i.test(error)) return 30_000;
+  return 0;
 }
 
-export function modelChain(tier: Tier): string[] {
-  const chain = tier === "deep" ? [...DEEP_MODELS, ...FAST_MODELS] : tier === "lite" ? LITE_MODELS : FAST_MODELS;
-  return Array.from(new Set(chain));
+export function markModelFailure(id: string, error: string, now = Date.now()): void {
+  const ms = cooldownFor(error);
+  if (ms > 0) unavailableUntil.set(id, now + ms);
+}
+
+export function __resetModelHealth(): void {
+  unavailableUntil.clear();
+}
+
+export function modelChain(tier: Tier, now = Date.now()): string[] {
+  const chain = Array.from(new Set(tier === "deep" ? [...DEEP_MODELS, ...FAST_MODELS] : tier === "lite" ? LITE_MODELS : FAST_MODELS));
+  const healthy = chain.filter((id) => (unavailableUntil.get(id) ?? 0) <= now);
+  return healthy.length > 0 ? healthy : chain;
 }
 
 function attemptSignal(outer: AbortSignal | undefined, ms: number | null): { signal: AbortSignal; controller: AbortController } {
@@ -73,26 +102,22 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]).finally(() => clearTimeout(timer));
 }
 
-function languageModel(id: string): LanguageModelV1 {
-  return provider()(id, { structuredOutputs: true });
-}
-
-/** Test seam: integration tests swap in MockLanguageModelV1 / MockEmbeddingModelV1. */
+/** Test seam: integration tests swap in MockLanguageModelV4 / MockEmbeddingModelV4. */
 type Overrides = {
-  languageModel?: (id: string) => LanguageModelV1;
-  embeddingModel?: Parameters<typeof embedMany>[0]["model"];
+  languageModel?: (id: string) => LanguageModel;
+  embeddingModel?: EmbeddingModel;
 };
 let overrides: Overrides = {};
 export function __setModelOverrides(o: Overrides): void {
   overrides = o;
 }
-function lm(id: string): LanguageModelV1 {
-  return overrides.languageModel ? overrides.languageModel(id) : languageModel(id);
+function lm(id: string): LanguageModel {
+  return overrides.languageModel ? overrides.languageModel(id) : provider()(id);
 }
 
 function describeError(err: unknown): string {
   if (err && typeof err === "object") {
-    const e = err as { statusCode?: number; message?: string; responseBody?: string };
+    const e = err as { statusCode?: number; message?: string };
     return `${e.statusCode ?? ""} ${e.message ?? ""}`.trim();
   }
   return String(err);
@@ -108,16 +133,21 @@ function upstreamError(errors: string[]): ApiRouteError {
   return new ApiRouteError(502, "AI_UPSTREAM", "The AI service returned an error. Try again.");
 }
 
+function logFailure(errors: string[]): void {
+  // Model ids and status codes only: never prompts or document text.
+  console.warn("[gemini] all models failed", errors.map((e) => e.slice(0, 160)));
+}
+
 /**
- * streamObject with model fallback: we read the stream until the first
- * content arrives. If a model fails before producing anything (quota, 404,
- * overload) we transparently try the next model in the chain. Once tokens
- * are flowing we commit to that model.
+ * Structured streaming with model fallback: we read the stream until the
+ * first JSON token arrives. If a model fails before producing anything
+ * (quota, 404, overload, first-token timeout) the next model in the chain
+ * is tried transparently. Once tokens flow we commit to that model.
  *
- * Returns a plain-text stream of the JSON being generated, which is exactly
- * what the AI SDK's useObject() consumes on the client.
+ * Returns a plain-text stream of the JSON being generated, which is what
+ * the AI SDK's useObject() consumes on the client.
  */
-export async function streamStructured<T extends z.ZodTypeAny>(opts: {
+export async function streamStructured<T extends z.ZodType>(opts: {
   tier: Tier;
   schema: T;
   prompt: string;
@@ -128,11 +158,11 @@ export async function streamStructured<T extends z.ZodTypeAny>(opts: {
   for (const id of modelChain(opts.tier)) {
     if (opts.signal?.aborted) break;
     const { signal, controller } = attemptSignal(opts.signal, null);
-    const result = streamObject({
+    const result = streamText({
       model: lm(id),
-      schema: opts.schema,
-      system: GUARDRAILS,
+      instructions: GUARDRAILS,
       prompt: opts.prompt,
+      output: Output.object({ schema: opts.schema }),
       temperature: opts.temperature ?? 0.2,
       maxRetries: 0,
       abortSignal: signal,
@@ -151,63 +181,64 @@ export async function streamStructured<T extends z.ZodTypeAny>(opts: {
           failed = true;
           break;
         }
-        if (part.type === "text-delta" && part.textDelta.length > 0) {
-          first = part.textDelta;
+        if (part.type === "text-delta" && part.text.length > 0) {
+          first = part.text;
           break;
         }
       }
     } catch (err) {
       errors.push(`${id}: ${err instanceof FirstTokenTimeout ? "timeout" : describeError(err)}`);
       failed = true;
-      controller.abort();
     }
     if (failed || first === null) {
       if (!failed) errors.push(`${id}: empty response`);
+      markModelFailure(id, errors[errors.length - 1]);
+      controller.abort();
       continue;
     }
 
     const encoder = new TextEncoder();
     const firstChunk = first;
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(firstChunk));
+      start(c) {
+        c.enqueue(encoder.encode(firstChunk));
       },
-      async pull(controller) {
-        // Keep reading until we enqueue something: a pull() that resolves without
-        // enqueuing is not re-invoked by the Streams machinery, so skipping the
-        // interleaved "object" parts must happen inside this loop.
+      async pull(c) {
+        // Keep reading until something is enqueued: a pull() that resolves
+        // without enqueuing is not re-invoked by the Streams machinery.
         try {
           while (true) {
             const next = await iterator.next();
             if (next.done) {
-              controller.close();
+              c.close();
               return;
             }
             const part = next.value;
-            if (part.type === "text-delta" && part.textDelta.length > 0) {
-              controller.enqueue(encoder.encode(part.textDelta));
+            if (part.type === "text-delta" && part.text.length > 0) {
+              c.enqueue(encoder.encode(part.text));
               return;
             }
             if (part.type === "error") {
-              controller.error(new Error("AI stream interrupted"));
+              c.error(new Error("AI stream interrupted"));
               return;
             }
           }
         } catch {
-          controller.error(new Error("AI stream interrupted"));
+          c.error(new Error("AI stream interrupted"));
         }
       },
       async cancel() {
+        controller.abort();
         await iterator.return?.();
       },
     });
     return { stream, model: id };
   }
-  console.warn("[gemini] all models failed", errors.map((e) => e.slice(0, 200)));
+  logFailure(errors);
   throw upstreamError(errors);
 }
 
-export async function generateStructured<T extends z.ZodTypeAny>(opts: {
+export async function generateStructured<T extends z.ZodType>(opts: {
   tier: Tier;
   schema: T;
   prompt: string;
@@ -218,75 +249,93 @@ export async function generateStructured<T extends z.ZodTypeAny>(opts: {
   for (const id of modelChain(opts.tier)) {
     if (opts.signal?.aborted) break;
     try {
-      const { object } = await generateObject({
+      const { output } = await generateText({
         model: lm(id),
-        schema: opts.schema,
-        system: GUARDRAILS,
+        instructions: GUARDRAILS,
         prompt: opts.prompt,
+        output: Output.object({ schema: opts.schema }),
         temperature: opts.temperature ?? 0,
         maxRetries: 0,
         abortSignal: attemptSignal(opts.signal, CALL_MS).signal,
       });
-      return { object: object as z.infer<T>, model: id };
+      return { object: output as z.infer<T>, model: id };
     } catch (err) {
       errors.push(`${id}: ${describeError(err)}`);
+      markModelFailure(id, errors[errors.length - 1]);
     }
   }
-  console.warn("[gemini] all models failed", errors.map((e) => e.slice(0, 200)));
+  logFailure(errors);
   throw upstreamError(errors);
 }
 
 // ---------------------------------------------------------------------------
-// Embeddings
+// Embeddings (returned int8-quantised; see lib/vector.ts)
 // ---------------------------------------------------------------------------
 
-function embeddingModel(taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY") {
-  if (overrides.embeddingModel) return overrides.embeddingModel;
-  return provider().textEmbeddingModel(EMBEDDING_MODEL, {
-    outputDimensionality: LIMITS.embeddingDims,
-    taskType,
-  });
+type TaskType = "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
+
+function embeddingModel(): EmbeddingModel {
+  return overrides.embeddingModel ?? provider().embedding(EMBEDDING_MODEL);
 }
 
-/** L2-normalise and round: truncated (MRL) Gemini embeddings are not unit length, and rounding shrinks the payload the browser holds. */
-export function compactVector(v: readonly number[]): number[] {
-  const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0)) || 1;
-  return v.map((x) => Math.round((x / norm) * 1e5) / 1e5);
+function embeddingOptions(taskType: TaskType) {
+  return { google: { outputDimensionality: LIMITS.embeddingDims, taskType } };
 }
 
-export async function embedDocuments(texts: string[]): Promise<number[][]> {
-  const { embeddings } = await embedMany({
-    model: embeddingModel("RETRIEVAL_DOCUMENT"),
-    values: texts,
+/** Embeds documents in batches of 100, three batches in flight at a time. */
+export async function embedDocuments(texts: string[], signal?: AbortSignal): Promise<string[]> {
+  const batches: string[][] = [];
+  for (let i = 0; i < texts.length; i += EMBED_BATCH) batches.push(texts.slice(i, i + EMBED_BATCH));
+  const results: string[][] = new Array(batches.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const index = next++;
+      const { embeddings } = await embedMany({
+        model: embeddingModel(),
+        values: batches[index],
+        providerOptions: embeddingOptions("RETRIEVAL_DOCUMENT"),
+        maxRetries: 1,
+        abortSignal: signal,
+      });
+      results[index] = embeddings.map(quantize);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(EMBED_CONCURRENCY, batches.length) }, worker));
+  return results.flat();
+}
+
+/** Query embedding as a unit float vector (full precision on the query side). */
+export async function embedQuery(text: string, signal?: AbortSignal): Promise<number[]> {
+  const { embedding } = await embed({
+    model: embeddingModel(),
+    value: text,
+    providerOptions: embeddingOptions("RETRIEVAL_QUERY"),
     maxRetries: 1,
+    abortSignal: signal,
   });
-  return embeddings.map(compactVector);
-}
-
-export async function embedQuery(text: string): Promise<number[]> {
-  const { embedding } = await embed({ model: embeddingModel("RETRIEVAL_QUERY"), value: text, maxRetries: 1 });
-  return compactVector(embedding);
+  return embedding;
 }
 
 // ---------------------------------------------------------------------------
 // OCR fallback for scanned PDFs
 // ---------------------------------------------------------------------------
 
-export async function transcribePdf(bytes: Uint8Array, prompt: string): Promise<string> {
-  const { generateText } = await import("ai");
+export async function transcribePdf(bytes: Uint8Array, prompt: string, signal?: AbortSignal): Promise<string> {
   const errors: string[] = [];
   for (const id of modelChain("fast")) {
+    if (signal?.aborted) break;
     try {
       const { text } = await generateText({
         model: lm(id),
         temperature: 0,
         maxRetries: 0,
-        abortSignal: AbortSignal.timeout(50_000),
+        abortSignal: attemptSignal(signal, 50_000).signal,
         messages: [
           {
             role: "user",
             content: [
-              { type: "file", data: bytes, mimeType: "application/pdf" },
+              { type: "file", data: bytes, mediaType: "application/pdf" },
               { type: "text", text: prompt },
             ],
           },
@@ -295,7 +344,9 @@ export async function transcribePdf(bytes: Uint8Array, prompt: string): Promise<
       return text;
     } catch (err) {
       errors.push(`${id}: ${describeError(err)}`);
+      markModelFailure(id, errors[errors.length - 1]);
     }
   }
+  logFailure(errors);
   throw upstreamError(errors);
 }

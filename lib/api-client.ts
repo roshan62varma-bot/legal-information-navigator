@@ -1,6 +1,6 @@
 "use client";
 
-import type { ApiError, AskEvent, DocumentChunk, DocumentPayload, IngestResponse, OcrResponse, Page, Preferences } from "@/types/legal";
+import type { ApiError, AskEvent, DocumentPayload, IngestResponse, OcrResponse, Page, Preferences, SignedIndex } from "@/types/legal";
 
 export class ClientApiError extends Error {
   constructor(message: string, public readonly code: string, public readonly status: number) {
@@ -56,7 +56,7 @@ export function toPayload(doc: DocumentPayload): DocumentPayload {
 
 /** Stream NDJSON AskEvents from /api/ask. */
 export async function askQuestion(
-  doc: DocumentPayload & { chunks: DocumentChunk[] },
+  doc: DocumentPayload & { index: SignedIndex | null },
   query: string,
   preferences: Preferences,
   onEvent: (e: AskEvent) => void,
@@ -65,7 +65,7 @@ export async function askQuestion(
   const res = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ documentId: doc.documentId, document: toPayload(doc), chunks: doc.chunks, query, preferences }),
+    body: JSON.stringify({ documentId: doc.documentId, document: toPayload(doc), index: doc.index, query, preferences }),
     signal,
   });
   if (!res.ok || !res.body) throw await asApiError(res);

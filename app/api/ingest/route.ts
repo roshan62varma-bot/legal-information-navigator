@@ -2,7 +2,7 @@ import type { OcrResponse, Page } from "@/types/legal";
 import { IngestRequestSchema, LIMITS } from "@/types/legal";
 import { looksScanned, normalizeWhitespace, splitTranscript, totalChars } from "@/lib/ingestion";
 import { ocrPrompt } from "@/lib/prompts";
-import { ApiRouteError, enforceRateLimit, errorResponse, parseBody } from "@/lib/server/http";
+import { ApiRouteError, enforceRateLimit, errorResponse, parseBody, readBodyLimited } from "@/lib/server/http";
 import { transcribePdf } from "@/lib/server/gemini";
 import { ingestDocument } from "@/lib/server/pipeline";
 
@@ -25,7 +25,7 @@ export async function POST(req: Request): Promise<Response> {
     const type = req.headers.get("content-type") ?? "";
     if (type.startsWith("multipart/form-data")) {
       enforceRateLimit(req, "ocr", 6);
-      return Response.json(await parseUploadedPdf(req), { headers: { "Cache-Control": "no-store" } });
+      return Response.json(await parseUploadedPdf(req, req.signal), { headers: { "Cache-Control": "no-store" } });
     }
     enforceRateLimit(req, "ingest", 20);
     const body = await parseBody(req, IngestRequestSchema);
@@ -35,14 +35,16 @@ export async function POST(req: Request): Promise<Response> {
     if (totalChars(body.pages) < 80) {
       throw new ApiRouteError(422, "DOCUMENT_EMPTY", "We could not find enough text in this document to analyse.");
     }
-    return Response.json(await ingestDocument(body.pages), { headers: { "Cache-Control": "no-store" } });
+    return Response.json(await ingestDocument(body.pages, req.signal), { headers: { "Cache-Control": "no-store" } });
   } catch (err) {
     return errorResponse(err);
   }
 }
 
-async function parseUploadedPdf(req: Request): Promise<OcrResponse> {
-  const form = await req.formData().catch(() => {
+async function parseUploadedPdf(req: Request, signal: AbortSignal): Promise<OcrResponse> {
+  // Cap the multipart body while streaming (file limit plus form overhead) before parsing it.
+  const raw = await readBodyLimited(req, LIMITS.maxFileBytes + 64 * 1024);
+  const form = await new Response(raw, { headers: { "content-type": req.headers.get("content-type") ?? "" } }).formData().catch(() => {
     throw new ApiRouteError(400, "INVALID_UPLOAD", "Upload a PDF file.");
   });
   const file = form.get("file");
@@ -56,7 +58,7 @@ async function parseUploadedPdf(req: Request): Promise<OcrResponse> {
   const parsed = await parseWithPdfParse(bytes).catch(() => [] as Page[]);
   if (parsed.length > 0 && !looksScanned(parsed)) return { pages: parsed, method: "pdf-parse" };
 
-  const transcript = await transcribePdf(bytes, ocrPrompt());
+  const transcript = await transcribePdf(bytes, ocrPrompt(), signal);
   const pages = splitTranscript(transcript);
   if (pages.length === 0) throw new ApiRouteError(422, "OCR_EMPTY", "No readable text was found in this PDF.");
   return { pages, method: "gemini-ocr" };

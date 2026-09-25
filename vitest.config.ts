@@ -9,7 +9,8 @@ export default defineConfig({
       "server-only": path.resolve(__dirname, "__tests__/helpers/empty.ts"),
     },
   },
-  esbuild: { jsx: "automatic" },
+  // Vite 8 transforms with Oxc; tests render JSX with the automatic runtime.
+  oxc: { jsx: { runtime: "automatic" } },
   test: {
     environment: "node",
     include: ["__tests__/**/*.test.{ts,tsx}"],

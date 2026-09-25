@@ -72,10 +72,27 @@ flowchart LR
 
 ## Security and privacy
 
+`npm audit`: **0 vulnerabilities**. Full threat model in [SECURITY.md](SECURITY.md).
+
 * **PII scrubbing in the browser** before any network call: names, emails, phones, street addresses, SSN / Aadhaar / PAN / passport numbers, IBAN / IFSC / account numbers and Luhn-valid card numbers become stable tokens like `[NAME_1]`. The UI reports what was removed.
-* **Prompt-injection defence**: every prompt is XML-structured (`<system>`, `<retrieved_context page section>`, `<user_query>`). Document and user text is stripped of instruction-like patterns ("ignore previous instructions", "act as", "jailbreak", ...) and of our own tags, and `< >` are escaped so a document cannot close its context block. The sample contract contains a planted injection so you can see it neutralized.
-* **Nothing is stored.** Routes are stateless; the document id is a SHA-256 content hash so the server can detect tampering (409) without keeping state. Request bodies are never logged.
-* **Hardening**: Zod validation on every route, typed `{ error, code }` errors with no stack traces, in-memory sliding-window rate limiting, a strict Content-Security-Policy (`connect-src 'self'`), HSTS, `X-Frame-Options: DENY`, and a key read only from server environment variables.
+* **Prompt-injection defence**: every prompt is XML-structured (`<system>`, `<retrieved_context page section>`, `<user_query>`). Document and user text is stripped of instruction-like patterns and of our own tags, and `< >` are escaped so a document cannot close its context block. The sample contract contains a planted injection so you can see it neutralized.
+* **Zero trust in the client.** The document id is a SHA-256 content hash re-checked on every call (409 on tampering). Chunk text is never accepted from the browser; the server re-derives it. The search index (embeddings) is **HMAC-SHA256 signed** at ingest and verified in constant time before every question.
+* **Nonce-based Content-Security-Policy** generated per request in `proxy.ts`: scripts run only with that request's nonce (`'strict-dynamic'`, no `'unsafe-inline'`/`'unsafe-eval'` in production), plus `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`, `connect-src 'self'`.
+* **API hardening**: `POST` only; cross-site requests rejected (`Sec-Fetch-Site`/`Origin`) so other sites cannot spend the Gemini quota; bodies read as a stream with a hard byte cap, strict UTF-8, `application/json` only; `.strict()` Zod schemas reject unknown keys; typed `{ error, code }` errors with no stack traces; sliding-window rate limits.
+* **Headers**: HSTS preload, `X-Frame-Options: DENY`, `nosniff`, COOP/CORP `same-origin`, `Origin-Agent-Cluster`, restrictive `Permissions-Policy`, `Referrer-Policy`.
+* **Nothing is stored** and request bodies are never logged. The API key lives only in `server-only` modules.
+* **Supply chain**: CI runs lint, typecheck, tests, `npm audit --audit-level=moderate` and a production build on every push; Dependabot keeps dependencies current.
+
+## Efficiency
+
+* **Compact index**: embeddings are L2-normalised and int8-quantised to 1,024 base64 characters per chunk, about **6x smaller** than JSON floats, with cosine error under 0.01 and identical top-5 ranking (tested). Similarity is a dot product on unit vectors.
+* **Smaller requests**: Q&A sends the pages and the signed vectors, never the chunk text twice.
+* **Parallel embedding**: 100 texts per call, 3 calls in flight.
+* **Circuit breaker**: a model that just hit quota, overload, a timeout or a 404 is skipped for a cooldown instead of costing every request another round trip; the next model in the chain answers immediately.
+* **Time-to-first-token budgets** per model attempt with automatic fallback; the fast tier uses Flash-Lite (about 1 s to first token).
+* **Streaming everywhere**: summaries, red flags, comparisons and consultation sheets render token by token; Q&A streams each pipeline stage.
+* **Instant local work first**: the red-flag pattern scan and the Myers diff run in the browser immediately, before Gemini responds.
+* **Frontend**: each tool panel is a separate code-split chunk loaded on first use and kept mounted afterwards; three.js, pdf.js and jsPDF load lazily; the 3D scenes stop rendering when off-screen or the tab is hidden (and render a still frame for reduced motion); streamed list items are memoised; browser state is read with `useSyncExternalStore` to avoid extra render passes; the pdf.js worker is served as a cached static file.
 
 ## Accessibility
 
@@ -87,19 +104,24 @@ flowchart LR
 
 ## Tech stack
 
-Next.js 14 (App Router) · TypeScript (strict) · Tailwind CSS · shadcn-style Radix components · pdfjs-dist · Vercel AI SDK + Google Gemini · Zod · jsPDF · three.js / react-three-fiber (hero scene) · Vitest.
+Next.js 16 (App Router, Turbopack, `proxy.ts`) · React 19 · TypeScript (strict) · Tailwind CSS · shadcn-style Radix components · pdfjs-dist · Vercel AI SDK 7 + Google Gemini · Zod · jsPDF · three.js / react-three-fiber 9 (hero scene) · Vitest 5 · ESLint 9 with the React Compiler rules.
 
 ## Project structure
 
 ```
 types/legal.ts            Zod schemas + types for every boundary
 lib/ingestion.ts          PII scrubber, injection sanitizer, chunking, content ids
-lib/retrieval.ts          cosine, BM25, reciprocal-rank fusion, reranking
+lib/retrieval.ts          dense (quantised) + BM25 search, reciprocal-rank fusion, reranking
+lib/vector.ts             int8 embedding quantisation and dot product
+lib/security.ts           CSP builder, nonce, cross-site request guard
 lib/prompts.ts            XML-structured, injection-hardened prompt templates
 lib/grounding.ts          citation verification + faithfulness check
 lib/heuristics.ts         deterministic red-flag pre-scan
 lib/diff.ts               Myers diff, clause segmentation, word diff
-lib/server/gemini.ts      Gemini models, fallback chains, embeddings, OCR
+lib/server/gemini.ts      Gemini models, fallback chains, circuit breaker, embeddings, OCR
+lib/server/signing.ts     HMAC signing of the client-held search index
+lib/server/http.ts        streamed body cap, JSON parsing, typed errors, rate limits
+proxy.ts                  per-request CSP nonce, API method and origin guard
 lib/server/pipeline.ts    ingest and ask pipelines
 app/api/*/route.ts        ingest, summarize, redflags, compare, ask, consult
 components/               viewer (pdf.js), upload, tools, preferences, 3D scene
@@ -112,7 +134,8 @@ __tests__/                unit, integration (mocked Gemini), a11y, fixture NDA
 npm install
 cp .env.example .env.local     # add GEMINI_API_KEY from https://aistudio.google.com/apikey
 npm run dev                    # http://localhost:3000
-npm test                       # 73 tests: schemas, PII, injection, chunking, retrieval, grounding, diff, red-flag precision, pipeline, a11y
+npm test                       # 92 tests: schemas, PII, injection, chunking, retrieval, grounding, diff, red-flag precision, pipeline, security, efficiency, a11y
+npm run lint && npm run typecheck && npm run audit
 npm run build
 ```
 
@@ -120,17 +143,18 @@ Try it without a file: **Try a sample NDA** loads a one-sided consulting NDA (wi
 
 ## Deploy (Vercel)
 
-Import the repository in Vercel, add the environment variable `GEMINI_API_KEY`, and deploy. No database or other services are needed. The pdf.js worker is copied into `public/` at build time (`prebuild`), which keeps the repository small.
+Import the repository in Vercel, add the environment variable `GEMINI_API_KEY` (optionally `INDEX_SIGNING_SECRET`), and deploy. No database or other services are needed. The pdf.js worker is copied into `public/` at build time (`prebuild`), which keeps the repository small.
 
 ## Tests
 
 | Suite | What it proves |
 |---|---|
-| `schemas.test.ts` | Every AI output shape validates; wrong enums, missing disclaimer, bad ids and wrong embedding sizes are rejected |
+| `schemas.test.ts` | Every AI output shape validates; wrong enums, missing disclaimer and bad ids are rejected; output-style prompts carry language and reading level |
 | `ingestion.test.ts` | PII removal per category with stable tokens; injection strings neutralized without damaging legal text; 512-token / 10 % overlap chunking with page + section metadata |
 | `retrieval-grounding.test.ts` | Cosine, BM25, hybrid fusion, reranker floor and failure fallback; citation verification, page repair, faithfulness gate; highlight matching; rate limiter |
 | `diff-redflags.test.ts` | Myers shortest edit script; clause diff on the sample NDAs; **fixture NDA with 5 known red flags all detected at the correct severity with no false positives** |
-| `pipeline.integration.test.ts` | Mocked Gemini end to end: ingest, retrieve, rerank, generate, verify; hallucinated quote rejected; irrelevant question refused without generation; injection never reaches the prompt; model fallback on quota errors |
+| `pipeline.integration.test.ts` | Mocked Gemini end to end: ingest, sign, retrieve, rerank, generate, verify; forged index rejected; hallucinated quote rejected; irrelevant question refused without generation; injection and PII never reach the prompt; model fallback on quota errors |
+| `security-efficiency.test.ts` | Nonce CSP, cross-site guard, streamed body cap without Content-Length, media type and UTF-8 checks, strict schemas, HMAC signing and tamper detection; int8 quantisation size, accuracy and ranking; circuit breaker |
 | `a11y.test.tsx` | axe-core WCAG 2.1 AA on upload, reading options and output components; token contrast ≥ 4.5:1 |
 
 ## Limitations
