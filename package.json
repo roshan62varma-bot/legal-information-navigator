@@ -33,7 +33,7 @@
     "react-dom": "^19.3.0",
     "server-only": "^0.0.1",
     "tailwind-merge": "^3.7.0",
-    "three": "^0.169.0",
+    "three": "^0.186.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -43,7 +43,7 @@
     "@types/pdf-parse": "^1.1.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@types/three": "^0.169.0",
+    "@types/three": "^0.186.0",
     "axe-core": "^4.13.0",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.3.6",
